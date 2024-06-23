@@ -24,15 +24,21 @@ def log_decorator(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):
         logging.debug(f"Calling function {func.__name__} with args: {args}, kwargs: {kwargs}")
-        result = await func(*args, **kwargs)
-        logging.debug(f"Function {func.__name__} returned: {result}")
-        return result
+        try:
+            result = await func(*args, **kwargs)
+            logging.debug(f"Function {func.__name__} returned: {result}")
+            return result
+        except Exception as e:
+            logging.error(f"Error in function {func.__name__}: {e}")
+            return None
     return wrapper
 
 blacklist: Dict[str, float] = {}
 pickle_file = 'addresses.pkl'
 valid_accounts: Dict[str, float] = {}
 generated_addresses: List[Tuple[int, str, str]] = []
+api_failures: Dict[str, int] = {}
+api_backoff: Dict[str, float] = {}
 
 def load_pickle(file: str) -> Dict[str, float]:
     if os.path.exists(file):
@@ -59,41 +65,76 @@ async def get_balance_via_api(bitcoin_address: str) -> float:
         f'https://blockchain.info/balance?active={bitcoin_address}',
         f'https://api.blockcypher.com/v1/btc/main/addrs/{bitcoin_address}/balance',
         f'https://sochain.com/api/v2/get_address_balance/BTC/{bitcoin_address}',
+        f'https://api.blockchair.com/bitcoin/dashboards/address/{bitcoin_address}',
         f'https://chain.api.btc.com/v3/address/{bitcoin_address}',
         f'https://blockexplorer.com/api/addr/{bitcoin_address}/balance',
-        f'https://blockstream.info/api/address/{bitcoin_address}'
+        f'https://blockstream.info/api/address/{bitcoin_address}',
+        f'https://api.smartbit.com.au/v1/blockchain/address/{bitcoin_address}',
+        f'https://btcbook.guarda.co/api/v2/address/{bitcoin_address}',
+        f'https://api.coinbase.com/v2/accounts/{bitcoin_address}',
+        f'https://api.blockcypher.com/v1/btc/main/addrs/{bitcoin_address}/balance',
+        f'https://api.blockcypher.com/v1/btc/test3/addrs/{bitcoin_address}/balance',
+        f'https://api.blockcypher.com/v1/btc/main/addrs/{bitcoin_address}/full',
+        f'https://api.blockcypher.com/v1/btc/test3/addrs/{bitcoin_address}/full'
     ]
+    random.shuffle(apis)
     async with aiohttp.ClientSession() as session:
         queue = Queue()
         for api_url in apis:
-            await queue.put(api_url)
-        tasks = [fetch_balance_from_queue(session, queue, bitcoin_address) for _ in range(4)]
+            await queue.put((api_url, bitcoin_address))
+        tasks = [fetch_balance_from_queue(session, queue) for _ in range(4)]
         results = await asyncio.gather(*tasks)
         for result in results:
             if result is not None:
                 return result
-        await asyncio.sleep(1)
 
 @log_decorator
-async def fetch_balance_from_queue(session: aiohttp.ClientSession, queue: Queue, bitcoin_address: str) -> float:
+async def fetch_balance_from_queue(session: aiohttp.ClientSession, queue: Queue) -> float:
     while not queue.empty():
-        api_url = await queue.get()
+        api_url, bitcoin_address = await queue.get()
+        if api_url in api_backoff and time.time() < api_backoff[api_url]:
+            logging.debug(f"Skipping {api_url} due to backoff")
+            continue
         try:
             async with session.get(api_url) as response:
+                logging.debug(f"Fetching balance for {bitcoin_address} from {api_url}: {response.status}")
                 if response.status == 200:
                     data = await response.json()
-                    if 'final_balance' in data:
-                        return data['final_balance'] / 10**8
-                    elif 'balance' in data:
-                        return data['balance'] / 10**8
-                    elif 'data' in data and 'confirmed_balance' in data['data']:
-                        return float(data['data']['confirmed_balance'])
+                    logging.debug(f"Data received from {api_url}: {data}")
+                    balance = extract_balance(data)
+                    if balance is not None:
+                        return balance
                 else:
                     logging.debug(f"Error fetching balance for {bitcoin_address} from {api_url}: {response.status}")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logging.debug(f"ClientError for {bitcoin_address} from {api_url}: {e}")
+            api_failures[api_url] = api_failures.get(api_url, 0) + 1
+            if api_failures[api_url] >= 3:
+                backoff_time = min(60 * 2 ** (api_failures[api_url] - 3), 3600)
+                api_backoff[api_url] = time.time() + backoff_time
+                logging.error(f"Backing off API {api_url} for {backoff_time} seconds due to repeated failures")
+                continue
         finally:
-            queue.task_done()
+            try:
+                queue.task_done()
+            except ValueError:
+                logging.error(f"task_done() called too many times for {api_url}")
+    return None
+
+def extract_balance(data: dict) -> float:
+    try:
+        if 'final_balance' in data:
+            return float(data['final_balance']) / 10**8
+        elif 'balance' in data:
+            return float(data['balance']) / 10**8
+        elif 'data' in data and 'confirmed_balance' in data['data']:
+            return float(data['data']['confirmed_balance'])
+        elif 'amount' in data:
+            return float(data['amount'])
+        elif 'available_balance' in data:
+            return float(data['available_balance'])
+    except (TypeError, ValueError) as e:
+        logging.error(f"Error extracting balance: {e}")
     return None
 
 @log_decorator
@@ -103,8 +144,10 @@ async def get_balance_via_rpc(bitcoin_address: str) -> float:
     payload = json.dumps({"method": "getreceivedbyaddress", "params": [bitcoin_address], "jsonrpc": "2.0"})
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=headers, data=payload) as response:
+            logging.debug(f"Fetching balance for {bitcoin_address} via RPC: {response.status}")
             if response.status == 200:
                 data = await response.json()
+                logging.debug(f"Data received from RPC: {data}")
                 return data['result']
             else:
                 logging.debug(f"Error fetching balance for {bitcoin_address} via RPC: {response.status}")
@@ -131,8 +174,10 @@ async def get_balance_via_public_rpc(bitcoin_address: str) -> float:
         auth = (rpc["user"], rpc["password"])
         try:
             response = requests.post(url, headers=headers, data=payload, auth=auth)
+            logging.debug(f"Fetching balance for {bitcoin_address} via public RPC {url}: {response.status_code}")
             if response.status_code == 200:
                 data = response.json()
+                logging.debug(f"Data received from public RPC {url}: {data}")
                 return data['result']
             else:
                 logging.debug(f"Error fetching balance for {bitcoin_address} via public RPC {url}: {response.status_code}")
@@ -158,7 +203,7 @@ async def check_address_balance(generated_address: str, number: int, hex_private
     if generated_address in valid_accounts and not recheck and not (recheck_valids and valid_accounts[generated_address] > 0):
         return None
     balance = await get_balance(generated_address)
-    if balance > 0:
+    if balance is not None and balance > 0:
         logging.info(colored(f"Decimal: {number}, Hex: {hex_private_key}, Address: {generated_address}, Balance: {balance} BTC", 'green'))
         valid_accounts[generated_address] = balance
         if args.use_pickle:
@@ -243,6 +288,9 @@ async def main():
         else:
             await generate_addresses(args.start, args.end, args.random_keys, args.thread_amount)
             await check_all_generated_addresses(args.show_invalid, args.recheck, args.recheck_valids)
+        
+        if args.use_pickle:
+            save_pickle(valid_accounts, args.pickle_file)
         
         if not args.loop_forever:
             break
