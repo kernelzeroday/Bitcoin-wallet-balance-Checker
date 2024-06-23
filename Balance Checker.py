@@ -36,7 +36,6 @@ def log_decorator(func):
 blacklist: Dict[str, float] = {}
 pickle_file = 'addresses.pkl'
 valid_accounts: Dict[str, float] = {}
-generated_addresses: List[Tuple[int, str, str]] = []
 api_failures: Dict[str, int] = {}
 api_backoff: Dict[str, float] = {}
 
@@ -199,24 +198,27 @@ async def generate_bitcoin_address(private_key_bytes: bytes) -> str:
     return bitcoin_address
 
 @log_decorator
-async def check_address_balance(generated_address: str, number: int, hex_private_key: str, show_invalid: bool, recheck: bool, recheck_valids: bool):
-    if generated_address in valid_accounts and not recheck and not (recheck_valids and valid_accounts[generated_address] > 0):
-        return None
-    balance = await get_balance(generated_address)
-    if balance is not None and balance > 0:
-        logging.info(colored(f"Decimal: {number}, Hex: {hex_private_key}, Address: {generated_address}, Balance: {balance} BTC", 'green'))
-        valid_accounts[generated_address] = balance
-        if args.use_pickle:
-            save_pickle(valid_accounts, args.pickle_file)
-        with open('valid_accounts.log', 'a') as f:
-            f.write(f"Decimal: {number}, Hex: {hex_private_key}, Address: {generated_address}, Balance: {balance} BTC\n")
-        return (number, hex_private_key, generated_address, balance)
-    elif show_invalid:
-        logging.info(colored(f"Decimal: {number}, Hex: {hex_private_key}, Address: {generated_address}, Balance: {balance} BTC", 'red'))
-    return None
+async def check_address_balance(address_queue: Queue, balance_queue: Queue, show_invalid: bool, recheck: bool, recheck_valids: bool):
+    while True:
+        generated_address, number, hex_private_key = await address_queue.get()
+        if generated_address in valid_accounts and not recheck and not (recheck_valids and valid_accounts[generated_address] > 0):
+            address_queue.task_done()
+            continue
+        balance = await get_balance(generated_address)
+        if balance is not None and balance > 0:
+            logging.info(colored(f"Decimal: {number}, Hex: {hex_private_key}, Address: {generated_address}, Balance: {balance} BTC", 'green'))
+            valid_accounts[generated_address] = balance
+            if args.use_pickle:
+                save_pickle(valid_accounts, args.pickle_file)
+            with open('valid_accounts.log', 'a') as f:
+                f.write(f"Decimal: {number}, Hex: {hex_private_key}, Address: {generated_address}, Balance: {balance} BTC\n")
+            await balance_queue.put((number, hex_private_key, generated_address, balance))
+        elif show_invalid:
+            logging.info(colored(f"Decimal: {number}, Hex: {hex_private_key}, Address: {generated_address}, Balance: {balance} BTC", 'red'))
+        address_queue.task_done()
 
 @log_decorator
-async def generate_and_store_address(number: int, random_keys: bool):
+async def generate_and_store_address(number: int, random_keys: bool, address_queue: Queue):
     if random_keys:
         private_key_bytes = random.randbytes(32)
         hex_private_key = private_key_bytes.hex()
@@ -224,26 +226,16 @@ async def generate_and_store_address(number: int, random_keys: bool):
         hex_private_key = hex(number)[2:].rjust(64, '0')
         private_key_bytes = bytes.fromhex(hex_private_key)
     generated_address = await generate_bitcoin_address(private_key_bytes)
-    generated_addresses.append((number, hex_private_key, generated_address))
+    await address_queue.put((generated_address, number, hex_private_key))
 
 @log_decorator
-async def check_all_generated_addresses(show_invalid: bool, recheck: bool, recheck_valids: bool):
-    total_found = 0
-    accounts_with_balance: List[Tuple[int, str, str, float]] = []
-    tasks = [check_address_balance(addr[2], addr[0], addr[1], show_invalid, recheck, recheck_valids) for addr in generated_addresses]
-    for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Checking Balances"):
-        result = await task
-        if result:
-            total_found += 1
-            accounts_with_balance.append(result)
-    logging.info(colored(f"Total accounts with balance: {total_found}", 'blue'))
-    for account in accounts_with_balance:
-        logging.info(colored(f"Decimal: {account[0]}, Hex: {account[1]}, Address: {account[2]}, Balance: {account[3]} BTC", 'yellow'))
-
-@log_decorator
-async def generate_addresses(start: int, end: int, random_keys: bool, thread_amount: int):
+async def generate_addresses(start: int, end: int, random_keys: bool, thread_amount: int, address_queue: Queue, balance_queue: Queue, balance_queue_max: int):
     with ThreadPoolExecutor(max_workers=thread_amount) as executor:
-        futures = [executor.submit(generate_and_store_address, number, random_keys) for number in range(start, end + 1)]
+        futures = []
+        for number in range(start, end + 1):
+            while balance_queue.qsize() >= balance_queue_max:
+                await asyncio.sleep(1)
+            futures.append(executor.submit(generate_and_store_address, number, random_keys, address_queue))
         for future in tqdm(as_completed(futures), total=len(futures), desc="Generating Addresses"):
             await future.result()
 
@@ -266,19 +258,36 @@ parser.add_argument('--rpc-port', type=int, default=8332, help='Bitcoin RPC port
 parser.add_argument('--rpc-user', type=str, help='Bitcoin RPC username')
 parser.add_argument('--rpc-password', type=str, help='Bitcoin RPC password')
 parser.add_argument('--public-rpc', action='store_true', help='Use public RPC instead of API calls')
+parser.add_argument('--dump-pkl', action='store_true', help='Dump all info stored in the pickle file')
+parser.add_argument('--balance-queue-max', type=int, default=1000, help='Maximum size of the balance queue')
 args = parser.parse_args()
 
 if args.use_pickle:
     valid_accounts = load_pickle(args.pickle_file)
 
 async def main():
+    global valid_accounts
     if args.show_valid:
         with open('valid_accounts.log', 'r') as f:
             for line in f:
                 logging.info(colored(line.strip(), 'yellow'))
         return
 
-    while True:
+    if args.dump_pkl:
+        logging.info(colored(f"Dumping contents of pickle file {args.pickle_file}:", 'yellow'))
+        for address, balance in valid_accounts.items():
+            logging.info(colored(f"Address: {address}, Balance: {balance} BTC", 'yellow'))
+        return
+
+    address_queue = Queue()
+    balance_queue = Queue()
+
+    address_generator_task = asyncio.create_task(generate_addresses(args.start, args.end, args.random_keys, args.thread_amount, address_queue, balance_queue, args.balance_queue_max))
+    balance_checker_task = asyncio.create_task(check_address_balance(address_queue, balance_queue, args.show_invalid, args.recheck, args.recheck_valids))
+
+    await asyncio.gather(address_generator_task, balance_checker_task)
+
+    while args.loop_forever:
         if args.random_max_keys:
             args.start = random.randint(0, args.random_max_keys)
             args.end = args.random_max_keys
@@ -286,16 +295,21 @@ async def main():
         if args.start > args.end:
             logging.error("Invalid range. The start number should be less than or equal to the end number.")
         else:
-            await generate_addresses(args.start, args.end, args.random_keys, args.thread_amount)
-            await check_all_generated_addresses(args.show_invalid, args.recheck, args.recheck_valids)
+            await generate_addresses(args.start, args.end, args.random_keys, args.thread_amount, address_queue, balance_queue, args.balance_queue_max)
+            
+            if args.use_pickle:
+                valid_accounts = load_pickle(args.pickle_file)
+            
+            await check_address_balance(address_queue, balance_queue, args.show_invalid, args.recheck, args.recheck_valids)
+            
+            if args.use_pickle:
+                save_pickle(valid_accounts, args.pickle_file)
         
+        args.recheck = False
+        args.recheck_valids = False
+
+        # Save valid accounts to pickle file after each loop iteration
         if args.use_pickle:
             save_pickle(valid_accounts, args.pickle_file)
-        
-        if not args.loop_forever:
-            break
-        else:
-            args.recheck = False
-            args.recheck_valids = False
 
 asyncio.run(main())
