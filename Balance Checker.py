@@ -112,7 +112,7 @@ async def fetch_balance_from_queue(session: aiohttp.ClientSession, queue: Queue)
             if api_failures[api_url] >= 3:
                 backoff_time = min(60 * 2 ** (api_failures[api_url] - 3), 3600)
                 api_backoff[api_url] = time.time() + backoff_time
-                logging.error(f"Backing off API {api_url} for {backoff_time} seconds due to repeated failures")
+                logging.debug(f"Backing off API {api_url} for {backoff_time} seconds due to repeated failures")
                 continue
         finally:
             try:
@@ -294,5 +294,8 @@ async def main():
         
         if not args.loop_forever:
             break
+        else:
+            args.recheck = False
+            args.recheck_valids = False
 
 asyncio.run(main())
